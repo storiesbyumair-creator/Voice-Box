@@ -151,7 +151,9 @@ function MainApp() {
 
     // Only auto-start server in production mode
     // In dev mode, user runs server separately
-    if (!import.meta.env?.PROD) {
+    const isDevMode = import.meta.env?.PROD === false || import.meta.env?.PROD === undefined;
+    console.log('MainApp: isDevMode =', isDevMode, 'PROD =', import.meta.env?.PROD);
+    if (isDevMode) {
       console.log('Dev mode: Skipping auto-start of server (run it separately)');
       setServerReady(true); // Mark as ready so UI doesn't show loading screen
       // Mark that server was not started by app (so we don't try to stop it on close)
