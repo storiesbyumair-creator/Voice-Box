@@ -1,10 +1,28 @@
-"""Kaggle bootstrap: install Voice Box deps, seed the Survée Vivian profile, pre-download the model.
-
-Runs on a Kaggle GPU notebook or any Linux box with internet.
+"""Kaggle bootstrap: install Voice Box dependencies, seed the Survée Vivian
+profile, and pre-download the Qwen CustomVoice model.
 
 Run from the Voice Box repository root:
 
     python kaggle/setup_voicebox.py
+
+Designed for Kaggle GPU notebooks, but also works on a Linux machine with
+internet access.
+
+Environment overrides:
+
+    VOICEBOX_TORCH_INDEX
+        PyTorch CUDA wheel index.
+        Default: https://download.pytorch.org/whl/cu128
+
+    VOICEBOX_DATA_DIR
+        Voice Box SQLite/audio data directory.
+        Kaggle default: /kaggle/working/voicebox-data
+        Other default:  ./data
+
+    VOICEBOX_MODELS_DIR
+        Hugging Face model cache directory.
+        Kaggle default: /kaggle/working/voicebox-models
+        Other default:  ./models-cache
 """
 
 from __future__ import annotations
@@ -15,8 +33,12 @@ import sys
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Paths / environment
+# ---------------------------------------------------------------------------
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-IS_KAGGLE = os.path.isdir("/kaggle/working")
+IS_KAGGLE = Path("/kaggle/working").is_dir()
 
 DATA_DIR = Path(
     os.environ.get("VOICEBOX_DATA_DIR")
@@ -41,6 +63,11 @@ TORCH_INDEX = os.environ.get(
     "https://download.pytorch.org/whl/cu128",
 )
 
+
+# ---------------------------------------------------------------------------
+# Survée Vivian profile
+# ---------------------------------------------------------------------------
+
 VIVIAN_PROFILE_ID = "d69609bd-1117-4a39-8d9c-1f57368b8835"
 
 VIVIAN_NAME = "Survée Waiter 1"
@@ -50,65 +77,238 @@ VIVIAN_DESCRIPTION = (
     "Warm, professional, natural, confident, clear, and conversational."
 )
 
-QWEN_CUSTOM_VOICE_1_7B = (
+QWEN_CUSTOM_VOICE_MODEL = (
     "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 )
 
 
-def _run(cmd: list[str], **kwargs) -> None:
-    print(f"\n$ {' '.join(cmd)}")
-    subprocess.check_call(
-        [sys.executable, "-m", "pip"] + cmd,
-        **kwargs,
-    )
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run_pip(args: list[str], **kwargs) -> None:
+    """Run pip using the same Python interpreter running this script."""
+    command = [sys.executable, "-m", "pip", *args]
+
+    print()
+    print("$", " ".join(command))
+
+    subprocess.check_call(command, **kwargs)
 
 
-def _torch_has_cuda() -> bool:
+def _check_cuda() -> bool:
+    """Check whether the currently installed PyTorch can access CUDA."""
     try:
         import torch
+    except ImportError:
+        print("PyTorch is not installed.")
+        return False
 
-        print(
-            f"PyTorch {torch.__version__} already installed — "
-            f"CUDA available: {torch.cuda.is_available()}"
+    cuda_available = torch.cuda.is_available()
+
+    print()
+    print("PyTorch environment")
+    print("-------------------")
+    print("PyTorch version :", torch.__version__)
+    print("CUDA available  :", cuda_available)
+    print("CUDA version    :", torch.version.cuda)
+
+    if cuda_available:
+        gpu_count = torch.cuda.device_count()
+
+        print("GPU count       :", gpu_count)
+
+        for index in range(gpu_count):
+            print(
+                f"GPU {index}         : "
+                f"{torch.cuda.get_device_name(index)}"
+            )
+
+    return cuda_available
+
+
+def _configure_paths() -> None:
+    """Configure directories used by Voice Box and Hugging Face."""
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    MODELS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    os.environ["VOICEBOX_DATA_DIR"] = str(DATA_DIR)
+    os.environ["VOICEBOX_MODELS_DIR"] = str(MODELS_DIR)
+
+    os.environ["HF_HUB_CACHE"] = str(MODELS_DIR)
+
+
+def _seed_vivian_profile() -> None:
+    """Initialize the Voice Box DB and seed the existing Vivian profile."""
+    # Make the repository importable.
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    # Configure Voice Box's data directory BEFORE importing/initializing
+    # the database.
+    from backend import config
+
+    config.set_data_dir(DATA_DIR)
+
+    # IMPORTANT:
+    #
+    # backend.database.__init__ re-exports SessionLocal:
+    #
+    #     from .session import SessionLocal
+    #
+    # That is a snapshot of the value at import time.
+    #
+    # backend.database.session.SessionLocal, however, is assigned dynamically
+    # by init_db().
+    #
+    # Therefore we deliberately import the session MODULE and access
+    # SessionLocal from that module AFTER init_db().
+    from backend.database import VoiceProfile, init_db
+    from backend.database import session as database_session
+
+    print()
+    print("Initializing Voice Box database...")
+    init_db()
+
+    if database_session.SessionLocal is None:
+        raise RuntimeError(
+            "Database initialization completed, but "
+            "backend.database.session.SessionLocal is still None."
         )
 
-        if torch.cuda.is_available():
-            print(f"CUDA version: {torch.version.cuda}")
-            print(f"GPU count: {torch.cuda.device_count()}")
+    db = database_session.SessionLocal()
 
-            for index in range(torch.cuda.device_count()):
-                print(
-                    f"GPU {index}: "
-                    f"{torch.cuda.get_device_name(index)}"
-                )
+    try:
+        existing = db.get(
+            VoiceProfile,
+            VIVIAN_PROFILE_ID,
+        )
 
-        return torch.cuda.is_available()
+        if existing is None:
+            profile = VoiceProfile(
+                id=VIVIAN_PROFILE_ID,
+                name=VIVIAN_NAME,
+                description=VIVIAN_DESCRIPTION,
+                language="zh",
+                voice_type="preset",
+                preset_engine="qwen_custom_voice",
+                preset_voice_id="Vivian",
+                design_prompt=None,
+                default_engine="qwen_custom_voice",
+                avatar_path=None,
+                personality=VIVIAN_DESCRIPTION,
+            )
 
-    except ImportError:
-        print("PyTorch is not installed yet.")
-        return False
+            db.add(profile)
+            db.commit()
+
+            print()
+            print("Vivian profile seeded successfully.")
+            print("  ID     :", VIVIAN_PROFILE_ID)
+            print("  Name   :", VIVIAN_NAME)
+            print("  Engine :", "qwen_custom_voice")
+            print("  Voice  :", "Vivian")
+
+        else:
+            print()
+            print("Vivian profile already exists.")
+            print("  ID     :", existing.id)
+            print("  Name   :", existing.name)
+            print("  Engine :", existing.preset_engine)
+            print("  Voice  :", existing.preset_voice_id)
+            print("  Action :", "existing profile preserved")
+
+    finally:
+        db.close()
+
+
+def _download_qwen_model() -> None:
+    """Download/cache the Qwen CustomVoice model."""
+    from huggingface_hub import snapshot_download
+
+    print()
+    print("=" * 60)
+    print("Downloading Qwen CustomVoice model")
+    print("=" * 60)
+    print("Model :", QWEN_CUSTOM_VOICE_MODEL)
+    print("Cache :", MODELS_DIR)
+
+    model_path = snapshot_download(
+        repo_id=QWEN_CUSTOM_VOICE_MODEL,
+        cache_dir=str(MODELS_DIR),
+    )
+
+    print()
+    print("Qwen model is ready.")
+    print("Path:", model_path)
 
 
 def main() -> int:
+    # -----------------------------------------------------------------------
+    # Validate repository
+    # -----------------------------------------------------------------------
+
     if not (REPO_ROOT / "backend").is_dir():
         print(
-            f"ERROR: backend/ not found under {REPO_ROOT}. "
-            "Run from the Voice Box repo root."
+            f"ERROR: backend/ was not found under {REPO_ROOT}."
+        )
+        print(
+            "Run this script from the Voice Box repository."
         )
         return 1
 
-    print("Voice Box Kaggle setup")
-    print(f"  repo root     : {REPO_ROOT}")
-    print(f"  data dir      : {DATA_DIR}")
-    print(f"  models dir    : {MODELS_DIR}")
-    print(f"  torch index   : {TORCH_INDEX}")
+    print()
+    print("=" * 60)
+    print("VOICE BOX — KAGGLE GPU SETUP")
+    print("=" * 60)
+    print()
+    print("Repository :", REPO_ROOT)
+    print("Kaggle     :", IS_KAGGLE)
+    print("Data dir   :", DATA_DIR)
+    print("Models dir :", MODELS_DIR)
+    print("Torch index:", TORCH_INDEX)
 
-    # 1. Upgrade pip.
-    _run(["install", "--upgrade", "pip"])
+    # -----------------------------------------------------------------------
+    # 1. pip
+    # -----------------------------------------------------------------------
 
-    # 2. Install CUDA-enabled PyTorch if necessary.
-    if not _torch_has_cuda():
-        _run(
+    print()
+    print("=" * 60)
+    print("1. Updating pip")
+    print("=" * 60)
+
+    _run_pip(
+        [
+            "install",
+            "--upgrade",
+            "pip",
+        ]
+    )
+
+    # -----------------------------------------------------------------------
+    # 2. PyTorch / CUDA
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print("2. Checking PyTorch / CUDA")
+    print("=" * 60)
+
+    cuda_ready = _check_cuda()
+
+    if not cuda_ready:
+        print()
+        print("CUDA is not available.")
+        print("Installing CUDA-enabled PyTorch...")
+
+        _run_pip(
             [
                 "install",
                 "torch",
@@ -118,17 +318,47 @@ def main() -> int:
             ]
         )
 
-    # 3. Install the repository's canonical backend dependencies.
-    _run(
+        print()
+        print("Rechecking CUDA...")
+
+        if not _check_cuda():
+            raise RuntimeError(
+                "PyTorch was installed, but CUDA is still unavailable."
+            )
+
+    # -----------------------------------------------------------------------
+    # 3. Voice Box requirements
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print("3. Installing Voice Box backend requirements")
+    print("=" * 60)
+
+    requirements_file = (
+        REPO_ROOT
+        / "backend"
+        / "requirements.txt"
+    )
+
+    _run_pip(
         [
             "install",
             "-r",
-            str(REPO_ROOT / "backend" / "requirements.txt"),
+            str(requirements_file),
         ]
     )
 
-    # 4. Install Chatterbox and TADA without dependency resolution.
-    _run(
+    # -----------------------------------------------------------------------
+    # 4. Chatterbox / TADA
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print("4. Installing Chatterbox / TADA pins")
+    print("=" * 60)
+
+    _run_pip(
         [
             "install",
             "--no-deps",
@@ -136,7 +366,7 @@ def main() -> int:
         ]
     )
 
-    _run(
+    _run_pip(
         [
             "install",
             "--no-deps",
@@ -144,125 +374,88 @@ def main() -> int:
         ]
     )
 
-    # 5. Install Qwen3-TTS.
-    _run(
+    # -----------------------------------------------------------------------
+    # 5. Qwen3-TTS
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print("5. Installing Qwen3-TTS")
+    print("=" * 60)
+
+    _run_pip(
         [
             "install",
             "git+https://github.com/QwenLM/Qwen3-TTS.git",
         ]
     )
 
-    # 6. Configure the Hugging Face model cache.
-    os.environ["VOICEBOX_MODELS_DIR"] = str(MODELS_DIR)
-    os.environ["HF_HUB_CACHE"] = str(MODELS_DIR)
+    # -----------------------------------------------------------------------
+    # 6. Configure cache/data paths
+    # -----------------------------------------------------------------------
 
-    MODELS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    print()
+    print("=" * 60)
+    print("6. Configuring Voice Box directories")
+    print("=" * 60)
 
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    _configure_paths()
 
-    # 7. Make the Voice Box repository importable.
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
+    print("VOICEBOX_DATA_DIR  =", DATA_DIR)
+    print("VOICEBOX_MODELS_DIR =", MODELS_DIR)
+    print("HF_HUB_CACHE       =", MODELS_DIR)
 
-    # 8. Configure the Voice Box data directory.
-    from backend import config
+    # -----------------------------------------------------------------------
+    # 7. Seed Vivian
+    # -----------------------------------------------------------------------
 
-    config.set_data_dir(DATA_DIR)
+    print()
+    print("=" * 60)
+    print("7. Initializing database and Vivian profile")
+    print("=" * 60)
 
-    # 9. Initialize the database.
-    #
-    # IMPORTANT:
-    # SessionLocal is created dynamically by init_db().
-    # Therefore we access it through the database module AFTER init_db()
-    # instead of importing SessionLocal by value before initialization.
-    from backend import database
-    from backend.database import VoiceProfile, init_db
+    _seed_vivian_profile()
 
-    init_db()
+    # -----------------------------------------------------------------------
+    # 8. Download Qwen model
+    # -----------------------------------------------------------------------
 
-    if database.SessionLocal is None:
-        raise RuntimeError(
-            "Database initialization did not create SessionLocal."
-        )
+    _download_qwen_model()
 
-    db = database.SessionLocal()
+    # -----------------------------------------------------------------------
+    # 9. Qwen import smoke test
+    # -----------------------------------------------------------------------
 
-    try:
-        existing = db.get(
-            VoiceProfile,
-            VIVIAN_PROFILE_ID,
-        )
+    print()
+    print("=" * 60)
+    print("9. Verifying Qwen3-TTS import")
+    print("=" * 60)
 
-        if existing is None:
-            db.add(
-                VoiceProfile(
-                    id=VIVIAN_PROFILE_ID,
-                    name=VIVIAN_NAME,
-                    description=VIVIAN_DESCRIPTION,
-                    language="zh",
-                    voice_type="preset",
-                    preset_engine="qwen_custom_voice",
-                    preset_voice_id="Vivian",
-                    design_prompt=None,
-                    default_engine="qwen_custom_voice",
-                    avatar_path=None,
-                    personality=VIVIAN_DESCRIPTION,
-                )
-            )
-
-            db.commit()
-
-            print(
-                f"Seeded profile "
-                f"{VIVIAN_PROFILE_ID} "
-                f"({VIVIAN_NAME})"
-            )
-
-        else:
-            print(
-                f"Profile {VIVIAN_PROFILE_ID} already present - "
-                "not overwriting "
-                f"(preset_engine={existing.preset_engine}, "
-                f"preset_voice_id={existing.preset_voice_id})"
-            )
-
-    finally:
-        db.close()
-
-    # 10. Pre-download Qwen CustomVoice 1.7B.
-    from huggingface_hub import snapshot_download
-
-    print(
-        f"\nPre-downloading "
-        f"{QWEN_CUSTOM_VOICE_1_7B} "
-        f"into {MODELS_DIR} ..."
-    )
-
-    path = snapshot_download(
-        repo_id=QWEN_CUSTOM_VOICE_1_7B,
-        cache_dir=str(MODELS_DIR),
-    )
-
-    print(f"Model ready at: {path}")
-
-    # 11. Verify Qwen3-TTS can be imported.
     from qwen_tts import Qwen3TTSModel  # noqa: F401
 
-    print("\n========================================")
-    print("Voice Box Kaggle setup COMPLETE")
-    print("========================================")
+    print("Qwen3TTSModel import: OK")
+
+    # -----------------------------------------------------------------------
+    # Complete
+    # -----------------------------------------------------------------------
+
     print()
-    print("Start the server with:")
+    print("=" * 60)
+    print("VOICE BOX KAGGLE SETUP COMPLETE")
+    print("=" * 60)
+    print()
+    print("GPU is ready.")
+    print("Vivian profile is ready.")
+    print("Qwen CustomVoice model is cached.")
+    print()
+    print("Next:")
+    print()
     print("  python kaggle/start_voicebox.py")
     print()
-    print("Then verify with:")
+    print("Then:")
+    print()
     print("  python kaggle/verify_voicebox.py")
+    print()
 
     return 0
 
